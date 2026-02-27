@@ -1,0 +1,27 @@
+# Sensitive secrets
+.env
+service_account.json
+
+# Environment and Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+
+# Application Temporary Data
+temp_covers/
+processed.json
+
+# Logs
+*.log
+analyzer_log.txt
+error.txt
+
+# OS/System files
+.DS_Store
+Thumbs.db
+
+# Large archives
+*.rar
+*.zip
+*.7z
