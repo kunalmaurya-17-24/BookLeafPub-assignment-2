@@ -73,6 +73,11 @@ BOTTOM_BADGE_ZONE_MM = 9.0    # reserved for "21st Century Emily Dickinson Award
 # We set this to 0.0 to enforce the strict 9mm rule.
 BADGE_DETECTION_BUFFER_MM = 0.0
 
+# Geometry → REVIEW threshold (in mm).
+# Any measured badge-overlap above this depth will force REVIEW_NEEDED.
+# Small overlaps below this are treated as near-miss / INFO only.
+GEOMETRY_REVIEW_THRESHOLD_MM = 2.0
+
 # Minimum acceptable image resolution
 MIN_DPI = 300  # Below this triggers a "low resolution" flag
 

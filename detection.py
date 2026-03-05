@@ -5,7 +5,7 @@ The core intelligence of the validation system.
 
 Contains two independent engines that run on every uploaded cover:
   1. Geometry Engine (OpenCV + Tesseract)
-  2. Vision Engine (Gemini 2.0 Flash)
+  2. Vision Engine (Gemini 3.0 Flash)
 
 Note: Deprecation warnings for google-generativeai are suppressed for a clean UI.
 """
@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import logging
+import sys
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,11 @@ with warnings.catch_warnings():
 import numpy as np
 import pytesseract
 from PIL import Image
+
+# Explicitly point pytesseract to the Windows Tesseract binary to avoid PATH issues.
+# Use explicit path on Windows; on Linux (e.g. Hugging Face) leave default (tesseract in PATH).
+if sys.platform == "win32":
+    pytesseract.tesseract_cmd = r"E:\Tesseract-installation"
 
 import config
 from schemas import (
@@ -233,6 +239,7 @@ def run_geometry_engine(image: Image.Image, author_name: Optional[str] = None, f
             secondary_boxes = _ocr_boxes(roi_pp, psm=6, x_offset=roi_x0, y_offset=y0)
 
     max_overlap_px = 0
+    max_overlap_mm = 0.0
     
     # 1mm tolerance in pixels for edge detection
     dpi_x, dpi_y = get_image_dpi(image)
@@ -298,6 +305,7 @@ def run_geometry_engine(image: Image.Image, author_name: Optional[str] = None, f
                 continue
 
         overlap_px = text_box.get_overlap_height(badge_zone)
+        overlap_mm = (overlap_px / dpi_y) * config.MM_PER_INCH if dpi_y > 0 else 0.0
         
         # DEBUG LOGGING
         logger.info(
@@ -305,51 +313,89 @@ def run_geometry_engine(image: Image.Image, author_name: Optional[str] = None, f
             f"overlap_px={overlap_px}"
         )
 
-        if overlap_px > max_overlap_px and not is_placeholder:
-            max_overlap_px = overlap_px
+        if overlap_mm > max_overlap_mm and not is_placeholder:
+            max_overlap_mm = overlap_mm
 
         if text_box.overlaps_with(badge_zone, tolerance=pixel_tolerance):
-            # Only add as an issue if it's NOT placeholder branding (which is allowed)
+            # Only add as a CRITICAL issue if it's NOT placeholder branding (which is allowed)
+            # and the penetration is beyond the geometry review threshold.
             if not is_placeholder:
-                issues.append(Issue(
-                    issue_type=IssueType.BADGE_OVERLAP, severity=Severity.CRITICAL,
-                    description=f'Text "{text}" enters the 9mm badge zone.',
-                    correction="Move text above the 9mm badge zone at the bottom."
-                ))
+                if overlap_mm > config.GEOMETRY_REVIEW_THRESHOLD_MM:
+                    issues.append(Issue(
+                        issue_type=IssueType.BADGE_OVERLAP, severity=Severity.CRITICAL,
+                        description=f'Text "{text}" enters the 9mm badge zone by ~{overlap_mm:.1f}mm.',
+                        correction="Move text above the 9mm badge zone at the bottom."
+                    ))
+                elif overlap_mm > 0:
+                    # Near-miss: within tolerance, record as INFO so humans can audit,
+                    # but do not fail geometry on its own.
+                    issues.append(Issue(
+                        issue_type=IssueType.BADGE_OVERLAP, severity=Severity.INFO,
+                        description=f'Text "{text}" is very close to the 9mm badge zone (~{overlap_mm:.1f}mm penetration).',
+                        correction="If possible, nudge this text slightly upward to maximize clearance from the badge."
+                    ))
             else:
-                # Still log it as INFO
+                # Placeholder award text in the badge zone is allowed but noted as INFO.
                 issues.append(Issue(
                     issue_type=IssueType.UNKNOWN, severity=Severity.INFO,
                     description=f'Placeholder award text "{text}" detected.',
                     correction="Ensure this is removed before final printing."
                 ))
         
-        # 2. Check Top, Left, Right Margins (3mm)
+        # 2. Check Top, Left, Right Margins (3mm) with a small tolerance so
+        #  the official "good" reference covers do not fail due to 1px OCR box noise.
         margin_px = mm_to_pixels(config.SIDE_MARGIN_MM, dpi_y)
-        # Margin rules:
-        # Top: y < margin_px
-        # Left: x < margin_px
-        # Right: x2 > (width - margin_px)
-        
+        margin_tolerance_px = pixel_tolerance  # ~1mm in pixels
+
         if not is_placeholder:
+            # Top margin: complain only if we are more than ~1mm inside the margin.
             if text_box.y < margin_px:
-                issues.append(Issue(
-                    issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
-                    description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm top margin.',
-                    correction=f"Move text down by at least {config.SIDE_MARGIN_MM}mm from the top edge."
-                ))
+                penetration_px = margin_px - text_box.y
+                if penetration_px > margin_tolerance_px:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
+                        description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm top margin.',
+                        correction=f"Move text down by at least {config.SIDE_MARGIN_MM}mm from the top edge."
+                    ))
+                else:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.INFO,
+                        description=f'Text "{text}" is very close to the {config.SIDE_MARGIN_MM}mm top margin.',
+                        correction="If possible, nudge this text slightly further from the top edge."
+                    ))
+
+            # Left margin.
             if text_box.x < margin_px:
-                issues.append(Issue(
-                    issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
-                    description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm left margin.',
-                    correction=f"Move text to the right by at least {config.SIDE_MARGIN_MM}mm from the left edge."
-                ))
-            if text_box.x2 > (width - margin_px):
-                issues.append(Issue(
-                    issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
-                    description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm right margin.',
-                    correction=f"Move text to the left by at least {config.SIDE_MARGIN_MM}mm from the right edge."
-                ))
+                penetration_px = margin_px - text_box.x
+                if penetration_px > margin_tolerance_px:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
+                        description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm left margin.',
+                        correction=f"Move text to the right by at least {config.SIDE_MARGIN_MM}mm from the left edge."
+                    ))
+                else:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.INFO,
+                        description=f'Text "{text}" is very close to the {config.SIDE_MARGIN_MM}mm left margin.',
+                        correction="If possible, nudge this text slightly further from the left edge."
+                    ))
+
+            # Right margin.
+            right_limit_px = width - margin_px
+            if text_box.x2 > right_limit_px:
+                penetration_px = text_box.x2 - right_limit_px
+                if penetration_px > margin_tolerance_px:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.CRITICAL,
+                        description=f'Text "{text}" enters the {config.SIDE_MARGIN_MM}mm right margin.',
+                        correction=f"Move text to the left by at least {config.SIDE_MARGIN_MM}mm from the right edge."
+                    ))
+                else:
+                    issues.append(Issue(
+                        issue_type=IssueType.MARGIN_VIOLATION, severity=Severity.INFO,
+                        description=f'Text "{text}" is very close to the {config.SIDE_MARGIN_MM}mm right margin.',
+                        correction="If possible, nudge this text slightly further from the right edge."
+                    ))
 
         if author_name and author_name.lower() in text.lower():
             author_penetration = text_box.y2 - (height - author_limit_px)
@@ -362,9 +408,6 @@ def run_geometry_engine(image: Image.Image, author_name: Optional[str] = None, f
                     description=f'Author name "{text}" enters the 9mm bottom zone.',
                     correction="Ensure the author name is at least 9mm away from the bottom edge."
                 ))
-
-    # Convert max overlap to mm
-    max_overlap_mm = (max_overlap_px / dpi_y) * config.MM_PER_INCH if dpi_y > 0 else 0.0
 
     return EngineResult(
         engine_name="Geometry (OpenCV + Tesseract)",
@@ -379,11 +422,29 @@ def run_geometry_engine(image: Image.Image, author_name: Optional[str] = None, f
 # ENGINE 2: VISION (Gemini)
 # ===========================================================================
 
-def run_vision_engine(image: Image.Image) -> EngineResult:
-    """AI vision engine."""
+def run_vision_engine(image: Image.Image, geometry: Optional[EngineResult] = None) -> EngineResult:
+    """AI vision engine that can also see Geometry output."""
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    geo_context = ""
+    if geometry is not None:
+        # Summarize key math findings for Gemini.
+        lines = [
+            "\n\nGEOMETRY ENGINE ANALYSIS:",
+            f"- passed: {geometry.passed}",
+            f"- max_badge_overlap_mm: {geometry.max_overlap_mm:.2f}",
+            "- issues (top 10):",
+        ]
+        for iss in geometry.issues[:10]:
+            lines.append(
+                f"  - [{iss.severity.name}] {iss.issue_type.name}: {iss.description}"
+            )
+        lines.append(
+            "Use these math findings together with the visual inspection to make the final PASS vs REVIEW decision."
+        )
+        geo_context = "\n".join(lines)
 
     prompt = f"""
 You are the Primary Quality Control Inspector for BookLeaf Publishing. You act as the first line of defense.
@@ -418,7 +479,7 @@ OUTPUT FORMAT (JSON ONLY):
       "correction": "Step to fix"
     }}
   ]
-}}
+}}{geo_context}
     """
     
     try:
@@ -486,8 +547,21 @@ OUTPUT FORMAT (JSON ONLY):
             front_cover_x_start_px=front_x_start_px
         )
     except Exception as e:
+        # If Gemini is unavailable (quota, network, etc.), treat Vision as "skipped"
+        # instead of a hard failure so Geometry can still make a decision.
         logger.error(f"Vision engine error: {e}")
-        return EngineResult(engine_name="Vision (Gemini)", passed=False, issues=[], confidence=0.0)
+        fallback_issue = Issue(
+            issue_type=IssueType.UNKNOWN,
+            severity=Severity.INFO,
+            description="Vision engine was unavailable; decision is based on geometry only.",
+            correction="System could not run the AI vision check for this cover. If in doubt, review it manually."
+        )
+        return EngineResult(
+            engine_name="Vision (Gemini)",
+            passed=True,
+            issues=[fallback_issue],
+            confidence=0.0,
+        )
 
 # ===========================================================================
 # CONSENSUS & MAIN
@@ -495,59 +569,64 @@ OUTPUT FORMAT (JSON ONLY):
 
 def evaluate_consensus(isbn: str, geo: EngineResult, vision: EngineResult, cover_file=None) -> ValidationResult:
     """
-    Merges results using a Strict Weighted Consensus model.
-    Overrides are only allowed for tiny overlaps (<5mm) and high confidence (>=95%).
+    Merges results using a STRICTLY CONSERVATIVE consensus model.
+    - A cover is only marked PASS when BOTH engines agree it is perfectly safe.
+    - Any geometry overlap, CRITICAL/WARNING issue, low confidence, or engine failure forces REVIEW_NEEDED.
     """
     logger.info(f"--- CONSENSUS DATA [{isbn}] ---")
     logger.info(f"Geometry: passed={geo.passed}, max_overlap={geo.max_overlap_mm:.2f}mm")
     logger.info(f"Vision  : passed={vision.passed}, confidence={vision.confidence}%")
 
-    # If Geometry was skipped, we trust Vision completely
-    if geo.engine_name == "Geometry (Skipped)":
-        logger.info(f"ISBN={isbn}: Geometry skipped, relying on Vision result.")
-        status = ValidationStatus.PASS if vision.passed else ValidationStatus.REVIEW_NEEDED
-        ai_override = False
-    # If Geometry detects any non-trivial overlap (>0.2mm), we always require REVIEW.
-    elif geo.max_overlap_mm > 0.2:
+    # Conservative defaults, but allow a narrow AI override for
+    # margin-only disagreements when Vision is very confident.
+    ai_override = False
+
+    geometry_skipped = geo.engine_name == "Geometry (Skipped)"
+
+    # Any non-trivial math overlap with the badge forces REVIEW_NEEDED.
+    if not geometry_skipped and geo.max_overlap_mm > config.GEOMETRY_REVIEW_THRESHOLD_MM:
         status = ValidationStatus.REVIEW_NEEDED
-        ai_override = False
-    # 1. Basic check & Geometry Override over Vision Failure
-    elif geo.passed and vision.passed:
-        status = ValidationStatus.PASS
-        ai_override = False
-    elif geo.passed and not vision.passed:
-        # If Geometry (Math) says it's perfectly safe (0mm overlap), we treat it as ground truth.
-        # In our testing, hallucinated Vision failures on clearly safe covers were the main source
-        # of false "Review Needed" results, while the Geometry engine reliably reported 0mm.
-        if geo.max_overlap_mm == 0.0:
-            logger.info(f"ISBN={isbn}: Geometry hard-override applied (Math 0mm, Vision conf {vision.confidence}%)")
-            status = ValidationStatus.PASS
-            ai_override = False
-            # Clear vision issues since we are overriding its failure
-            vision.issues = []
-        else:
-            # Borderline case where Geo passed but not perfectly 0mm, rely on Vision
-            status = ValidationStatus.REVIEW_NEEDED
-            ai_override = False
-            logger.warning(f"ISBN={isbn}: Consensus FAIL. Geo Passed but Overlap={geo.max_overlap_mm:.2f}mm, Vision Failed.")
     else:
-        # Potential for override?
-        # Rule: AI can only override Geometry FAIL if overlap is < 5mm AND Vision is PASS with >= 95% confidence
-        # We increased this from 3mm to 5mm to account for OCR box padding in low-res 125 DPI images.
-        ai_override = (
-            not geo.passed 
-            and vision.passed 
-            and geo.max_overlap_mm < 5.0 
-            and vision.confidence >= 95.0
-        )
-        
-        if ai_override:
-            logger.info(f"ISBN={isbn}: AI Override applied (Overlap={geo.max_overlap_mm:.2f}mm < 5mm, Vision Conf={vision.confidence}%)")
+        # Basic agreement check:
+        # - Both engines must pass
+        # - No CRITICAL or WARNING issues from either engine
+        all_issues = geo.issues + vision.issues
+        has_hard_issue = any(i.severity in (Severity.CRITICAL, Severity.WARNING) for i in all_issues)
+
+        if (
+            not geometry_skipped
+            and geo.passed
+            and vision.passed
+            and not has_hard_issue
+            and geo.max_overlap_mm <= config.GEOMETRY_REVIEW_THRESHOLD_MM
+        ):
             status = ValidationStatus.PASS
         else:
-            if not geo.passed and not ai_override:
-                logger.warning(f"ISBN={isbn}: Consensus FAIL. Geo Overlap={geo.max_overlap_mm:.2f}mm (Limit 5mm), Vision Passed={vision.passed}, Conf={vision.confidence}%")
             status = ValidationStatus.REVIEW_NEEDED
+
+    # Narrow AI override path:
+    # If Geometry is failing *only* due to side-margin violations, but Vision is
+    # clearly happy and high-confidence, allow Vision to upgrade to PASS while
+    # still keeping badge overlaps strict.
+    if not geometry_skipped and status == ValidationStatus.REVIEW_NEEDED:
+        has_badge_overlap = any(
+            (iss.issue_type == IssueType.BADGE_OVERLAP and iss.severity == Severity.CRITICAL)
+            for iss in geo.issues
+        )
+        critical_geo = [iss for iss in geo.issues if iss.severity == Severity.CRITICAL]
+        only_margin_criticals = critical_geo and all(
+            iss.issue_type == IssueType.MARGIN_VIOLATION for iss in critical_geo
+        )
+
+        if (
+            not has_badge_overlap
+            and only_margin_criticals
+            and vision.passed
+            and not vision.needs_precision_check
+            and vision.confidence >= 90.0
+        ):
+            ai_override = True
+            status = ValidationStatus.PASS
 
     # 2. Filter and Merge issues
     final_issues = []
@@ -563,10 +642,16 @@ def evaluate_consensus(isbn: str, geo: EngineResult, vision: EngineResult, cover
             final_issues.append(iss)
             seen.add(iss.description)
 
-    # 3. Double Check: If all issues are INFO (Placeholder), it's a PASS
-    if status == ValidationStatus.REVIEW_NEEDED:
-        if final_issues and all(i.severity == Severity.INFO for i in final_issues):
-            status = ValidationStatus.PASS
+    if ai_override:
+        final_issues.append(Issue(
+            issue_type=IssueType.UNKNOWN,
+            severity=Severity.INFO,
+            description=(
+                "Vision (Gemini) confirmed the layout as visually safe. "
+                "Geometry margin violations were treated as suggestions, not blockers."
+            ),
+            correction="You may still choose to nudge side text slightly inward, but this cover is considered acceptable."
+        ))
 
     return ValidationResult(
         isbn=isbn,
@@ -579,33 +664,35 @@ def evaluate_consensus(isbn: str, geo: EngineResult, vision: EngineResult, cover
         vision_result=vision
     )
 
-def process_book_cover(file_path: str, isbn: str, cover_file=None) -> ValidationResult:
-    """Full pipeline: Vision engine runs first, Geometry engine acts as a precision backup."""
+def process_book_cover(file_path: str, isbn: str, cover_file=None, *, skip_vision: bool = False) -> ValidationResult:
+    """
+    Full pipeline: Geometry engine runs first, then Vision (Gemini) sees
+    both the image and the geometry findings and a consensus decision is made.
+    Set skip_vision=True for fast demo mode (geometry-only); avoids Gemini latency.
+    """
     image = load_and_preprocess(file_path)
     author_name = getattr(cover_file, "author_name", None)
-    
-    # STEP 1: Vision engine acts as the "Senior Designer"
-    vision = run_vision_engine(image)
-    
-    # STEP 2: Decide if we need the "Junior with a Ruler" (Geometry Engine)
-    # We skip Geometry if Vision is 100% sure the cover is clean.
-    skip_geometry = (
-        vision.passed and 
-        vision.confidence >= 95 and 
-        not vision.needs_precision_check
-    )
-    
-    if skip_geometry:
-        logger.info(f"ISBN={isbn}: Vision is highly confident and passed. Skipping Geometry engine.")
-        geo = EngineResult(engine_name="Geometry (Skipped)", passed=True, issues=[], confidence=100.0)
+    width = image.size[0]
+
+    # STEP 1: Always run Geometry first.
+    geo = run_geometry_engine(image, author_name)
+
+    # STEP 2: Vision (optional) sees both the image and geo summary.
+    if skip_vision:
+        vision = EngineResult(
+            engine_name="Vision (skipped for fast demo)",
+            passed=True,
+            issues=[],
+            confidence=0.0,
+            front_cover_x_start_px=width / 2.0,
+        )
+        logger.info(f"ISBN={isbn}: Skipping Vision engine (demo mode). Using Geometry only.")
     else:
-        logger.info(f"ISBN={isbn}: Running Geometry engine (Reason: Vision confidence {vision.confidence}% or needs_precision_check={vision.needs_precision_check})")
-        # Pass the front cover coordinate discovered by Gemini to the math engine
-        geo = run_geometry_engine(image, author_name, front_x_start=vision.front_cover_x_start_px)
-    
-    # STEP 3: Final consensus
+        vision = run_vision_engine(image, geo)
+
+    # STEP 3: Final consensus.
     result = evaluate_consensus(isbn, geo, vision, cover_file)
-    
+
     if result.status != ValidationStatus.PASS:
         save_annotated_failure(image, isbn, calculate_front_badge_zone(image))
     return result

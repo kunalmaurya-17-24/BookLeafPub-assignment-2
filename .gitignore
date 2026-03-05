@@ -1,6 +1,14 @@
-# Sensitive secrets
+# Sensitive secrets (never commit)
 .env
 service_account.json
+credentials.json
+*.pem
+*.key
+
+# Editor / IDE state
+.cursor/
+.vscode/
+.idea/
 
 # Environment and Python
 .venv/
@@ -11,6 +19,7 @@ __pycache__/
 # Application Temporary Data
 temp_covers/
 processed.json
+terminals/
 
 # Logs
 *.log
